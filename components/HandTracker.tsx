@@ -6,6 +6,10 @@ interface HandTrackerProps {
   onHandUpdate: (data: HandData) => void;
 }
 
+// Smoothing helper for gesture values
+const lerp = (current: number, target: number, speed: number) => 
+  current + (target - current) * speed;
+
 export const HandTracker: React.FC<HandTrackerProps> = ({ onHandUpdate }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [initialized, setInitialized] = useState(false);
@@ -13,6 +17,26 @@ export const HandTracker: React.FC<HandTrackerProps> = ({ onHandUpdate }) => {
   const lastVideoTime = useRef(-1);
   const requestRef = useRef<number>(0);
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
+  
+  // Smoothed values for stable gesture output
+  const smoothedRef = useRef({
+    expansion: 0.5,
+    tension: 0,
+    centerX: 0,
+    centerY: 0,
+    rotation: 0,
+    twist: 0,
+    velocity: 0
+  });
+  
+  // Previous frame data for velocity calculation
+  const prevFrameRef = useRef({
+    centerX: 0,
+    centerY: 0,
+    timestamp: 0,
+    hand1Y: 0,
+    hand2Y: 0
+  });
 
   useEffect(() => {
     const initHandLandmarker = async () => {
@@ -73,7 +97,6 @@ export const HandTracker: React.FC<HandTrackerProps> = ({ onHandUpdate }) => {
     startWebcam();
 
     return () => {
-      // Cleanup stream
       if (videoRef.current && videoRef.current.srcObject) {
         const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
         tracks.forEach(track => track.stop());
@@ -92,49 +115,92 @@ export const HandTracker: React.FC<HandTrackerProps> = ({ onHandUpdate }) => {
       
       const results = handLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs);
       
-      processResults(results);
+      processResults(results, startTimeMs);
     }
     
     requestRef.current = requestAnimationFrame(predictWebcam);
   };
 
-  const processResults = (results: any) => {
+  const processResults = (results: any, timestamp: number) => {
+    const smoothed = smoothedRef.current;
+    const prevFrame = prevFrameRef.current;
+    const smoothingSpeed = 0.15; // Higher = more responsive, lower = smoother
+    
     if (!results.landmarks || results.landmarks.length === 0) {
+      // Decay values when no hands present
+      smoothed.expansion = lerp(smoothed.expansion, 0.5, 0.05);
+      smoothed.tension = lerp(smoothed.tension, 0, 0.05);
+      smoothed.rotation = lerp(smoothed.rotation, 0, 0.05);
+      smoothed.twist = lerp(smoothed.twist, 0, 0.05);
+      smoothed.velocity = lerp(smoothed.velocity, 0, 0.1);
+      
       onHandUpdate({
-        expansion: 0.5, // Default to neutral
-        tension: 0,
+        expansion: smoothed.expansion,
+        tension: smoothed.tension,
         isPresent: false,
-        centerX: 0,
-        centerY: 0
+        centerX: smoothed.centerX,
+        centerY: smoothed.centerY,
+        rotation: smoothed.rotation,
+        twist: smoothed.twist,
+        velocity: smoothed.velocity,
+        grabbing: false
       });
       return;
     }
 
-    let expansion = 0;
-    let tension = 0;
-    let centerX = 0;
-    let centerY = 0;
+    let rawExpansion = 0.5;
+    let rawTension = 0;
+    let rawCenterX = 0;
+    let rawCenterY = 0;
+    let rawRotation = 0;
+    let rawTwist = 0;
+    let grabbing = false;
 
-    // 1. Calculate Expansion (Distance between two hands)
+    // ═══════════════════════════════════════════════════════════════
+    // GESTURE: Expansion (Distance between two hands)
+    // ═══════════════════════════════════════════════════════════════
     if (results.landmarks.length === 2) {
       const hand1 = results.landmarks[0][0]; // Wrist
       const hand2 = results.landmarks[1][0]; // Wrist
       
-      // Calculate normalized distance (0 to 1 roughly)
       const dist = Math.sqrt(
         Math.pow(hand1.x - hand2.x, 2) + 
         Math.pow(hand1.y - hand2.y, 2)
       );
       
-      // Remap distance: 0.1 (close) to 0.8 (far) -> 0 to 1
-      expansion = Math.max(0, Math.min(1, (dist - 0.1) * 1.5));
-    } else {
-       // Only one hand, default expansion to neutral
-       expansion = 0.5;
+      rawExpansion = Math.max(0, Math.min(1, (dist - 0.1) * 1.5));
+      
+      // ═══════════════════════════════════════════════════════════════
+      // GESTURE: Rotation (Hands moving in opposite Y directions)
+      // ═══════════════════════════════════════════════════════════════
+      const hand1YVel = hand1.y - prevFrame.hand1Y;
+      const hand2YVel = hand2.y - prevFrame.hand2Y;
+      
+      // If hands moving in opposite directions, we have rotation
+      if (Math.sign(hand1YVel) !== Math.sign(hand2YVel)) {
+        rawRotation = (hand2YVel - hand1YVel) * 10; // Scale for sensitivity
+        rawRotation = Math.max(-1, Math.min(1, rawRotation));
+      }
+      
+      // ═══════════════════════════════════════════════════════════════
+      // GESTURE: Twist (Hands circling around each other)
+      // ═══════════════════════════════════════════════════════════════
+      const currentAngle = Math.atan2(hand2.y - hand1.y, hand2.x - hand1.x);
+      // We'd need previous angle for delta, simplified to use X velocity differential
+      const hand1XVel = hand1.x - prevFrame.centerX;
+      const twistIndicator = Math.abs(hand1YVel - hand2YVel) + Math.abs(hand1XVel);
+      rawTwist = Math.min(1, twistIndicator * 5);
+      
+      prevFrame.hand1Y = hand1.y;
+      prevFrame.hand2Y = hand2.y;
     }
 
-    // 2. Calculate Tension (Average finger tip distance to wrist)
+    // ═══════════════════════════════════════════════════════════════
+    // GESTURE: Tension (Finger curl - fist vs open hand)
+    // ═══════════════════════════════════════════════════════════════
     let totalTension = 0;
+    let totalGrabbing = 0;
+    
     results.landmarks.forEach((landmarks: any) => {
       const wrist = landmarks[0];
       const tips = [4, 8, 12, 16, 20]; // Fingertip indices
@@ -149,45 +215,70 @@ export const HandTracker: React.FC<HandTrackerProps> = ({ onHandUpdate }) => {
       });
       avgDist /= tips.length;
 
-      // Map avgDist: 0.15 (fist/tight) to 0.4 (open/relaxed)
-      // High tension (fist) = 1, Low tension (open) = 0
-      // These threshold values might need tweaking based on camera distance
-      const t = 1 - Math.max(0, Math.min(1, (avgDist - 0.15) * 4));
+      // High tension = fist, low tension = open
+      const t = 1 - Math.max(0, Math.min(1, (avgDist - 0.12) * 5));
       totalTension += t;
+      
+      // Grabbing = high tension
+      if (t > 0.6) totalGrabbing++;
     });
     
-    tension = totalTension / results.landmarks.length;
+    rawTension = totalTension / results.landmarks.length;
+    grabbing = totalGrabbing === results.landmarks.length && results.landmarks.length === 2;
 
-    // 3. Center Position
+    // ═══════════════════════════════════════════════════════════════
+    // GESTURE: Center Position & Velocity
+    // ═══════════════════════════════════════════════════════════════
     let count = 0;
     results.landmarks.forEach((landmarks: any) => {
-        const w = landmarks[0];
-        centerX += w.x;
-        centerY += w.y;
-        count++;
+      const w = landmarks[0];
+      rawCenterX += w.x;
+      rawCenterY += w.y;
+      count++;
     });
     
     if (count > 0) {
-        centerX /= count;
-        centerY /= count;
-        
-        // Mirror X for intuitive control (moving hand right moves particles right)
-        // Webcam is usually mirrored by default visually, but coordinates might need flipping
-        // MediaPipe coords: x: 0 (left) -> 1 (right)
-        // We want -1 (left) to 1 (right)
-        
-        // Note: We mirror the calculation because standard webcam view feels mirrored
-        centerX = (1 - centerX) * 2 - 1; 
-        centerY = (1 - centerY) * 2 - 1; // 1 is bottom, we map to -1 (bottom) to 1 (top)? No, keep Y intuitive
-        centerY = -(centerY); // Flip Y so up is up
+      rawCenterX /= count;
+      rawCenterY /= count;
+      
+      // Calculate velocity (for clap detection)
+      const dt = (timestamp - prevFrame.timestamp) / 1000;
+      if (dt > 0 && dt < 0.5) {
+        const dx = rawCenterX - prevFrame.centerX;
+        const dy = rawCenterY - prevFrame.centerY;
+        const rawVelocity = Math.sqrt(dx * dx + dy * dy) / dt;
+        smoothed.velocity = lerp(smoothed.velocity, Math.min(1, rawVelocity * 2), 0.3);
+      }
+      
+      // Mirror X for intuitive control
+      rawCenterX = (1 - rawCenterX) * 2 - 1;
+      rawCenterY = -((1 - rawCenterY) * 2 - 1);
+      
+      prevFrame.centerX = rawCenterX;
+      prevFrame.centerY = rawCenterY;
+      prevFrame.timestamp = timestamp;
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Apply smoothing for stable output
+    // ═══════════════════════════════════════════════════════════════
+    smoothed.expansion = lerp(smoothed.expansion, rawExpansion, smoothingSpeed);
+    smoothed.tension = lerp(smoothed.tension, rawTension, smoothingSpeed);
+    smoothed.centerX = lerp(smoothed.centerX, rawCenterX, smoothingSpeed);
+    smoothed.centerY = lerp(smoothed.centerY, rawCenterY, smoothingSpeed);
+    smoothed.rotation = lerp(smoothed.rotation, rawRotation, smoothingSpeed * 0.5);
+    smoothed.twist = lerp(smoothed.twist, rawTwist, smoothingSpeed * 0.3);
+
     onHandUpdate({
-        expansion,
-        tension,
-        isPresent: true,
-        centerX,
-        centerY
+      expansion: smoothed.expansion,
+      tension: smoothed.tension,
+      isPresent: true,
+      centerX: smoothed.centerX,
+      centerY: smoothed.centerY,
+      rotation: smoothed.rotation,
+      twist: smoothed.twist,
+      velocity: smoothed.velocity,
+      grabbing
     });
   };
 
